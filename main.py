@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+"""Service entry point.
 
-app = FastAPI()
+Run locally with:  uv run uvicorn main:app --reload
+"""
+from obs.app import app, create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app", "create_app"]
