@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""服务入口：保持 `uvicorn main:app` 的既有启动方式不变。"""
 
-app = FastAPI()
+from observability.app import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
