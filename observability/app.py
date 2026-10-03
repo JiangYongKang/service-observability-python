@@ -21,6 +21,11 @@ from dataclasses import asdict
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from observability.aggregation import (
+    DEFAULT_TOTAL_TIMEOUT_SECONDS,
+    AggregationEngine,
+    DependencySpec,
+)
 from observability.context import current_trace_id
 from observability.downstream import DownstreamClient
 from observability.errors import (
@@ -40,6 +45,14 @@ logger = get_logger("observability.app")
 
 DOWNSTREAM_BASE_URL = os.environ.get("DOWNSTREAM_BASE_URL", "http://downstream.local")
 DOWNSTREAM_TIMEOUT = float(os.environ.get("DOWNSTREAM_TIMEOUT", "2.0"))
+AGGREGATE_TOTAL_TIMEOUT = float(
+    os.environ.get("AGGREGATE_TOTAL_TIMEOUT", str(DEFAULT_TOTAL_TIMEOUT_SECONDS))
+)
+
+#: 聚合默认扇出的依赖集合（名称稳定、进指标标签；可被 app.state 覆盖）
+DEFAULT_AGGREGATE_DEPENDENCIES: tuple[DependencySpec, ...] = (
+    DependencySpec(name="items", path="/items/aggregate"),
+)
 
 
 def create_app() -> FastAPI:
@@ -74,6 +87,24 @@ def _get_downstream(request: Request) -> DownstreamClient:
     return client
 
 
+def _get_aggregate_dependencies(request: Request) -> list[DependencySpec]:
+    """依赖：允许测试通过 ``app.state.aggregate_dependencies`` 注入依赖集合。"""
+    deps = getattr(request.app.state, "aggregate_dependencies", None)
+    if deps is None:
+        deps = list(DEFAULT_AGGREGATE_DEPENDENCIES)
+    return deps
+
+
+def _get_aggregate_timeout(request: Request) -> float:
+    """依赖：允许测试通过 ``app.state.aggregate_total_timeout`` 覆盖总时长上限。"""
+    return float(getattr(request.app.state, "aggregate_total_timeout", AGGREGATE_TOTAL_TIMEOUT))
+
+
+def _render_aggregate_response(result) -> JSONResponse:
+    """把聚合收口结果渲染为对外响应（骨架：占位实现）。"""
+    raise NotImplementedError
+
+
 def _register_routes(app: FastAPI) -> None:
     @app.get("/", include_in_schema=False)
     async def read_root() -> dict[str, str]:
@@ -95,6 +126,20 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/metrics", include_in_schema=False)
     async def get_metrics() -> dict[str, Any]:
         return registry.snapshot()
+
+    @app.get("/aggregate")
+    async def get_aggregate(
+        request: Request,
+        downstream: DownstreamClient = Depends(_get_downstream),
+        dependencies: list[DependencySpec] = Depends(_get_aggregate_dependencies),
+        total_timeout: float = Depends(_get_aggregate_timeout),
+    ) -> JSONResponse:
+        # 骨架：扇出/收口逻辑在 AggregationEngine 中实现，此处仅装配
+        engine = AggregationEngine(
+            downstream, dependencies, total_timeout=total_timeout
+        )
+        result = await engine.aggregate()
+        return _render_aggregate_response(result)
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
