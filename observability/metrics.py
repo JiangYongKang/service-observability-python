@@ -33,6 +33,12 @@ OVERFLOW_ROUTE = "__overflow__"
 #: 路由标签允许的不同取值上限（含两个占位），超出即降级
 MAX_ROUTE_CARDINALITY = 50
 
+#: 依赖标签基数降级后合并到的占位标签
+OVERFLOW_DEPENDENCY = "__overflow__"
+
+#: 依赖标签允许的不同取值上限（含占位），超出即降级
+MAX_DEPENDENCY_CARDINALITY = 20
+
 
 class Result(str, Enum):
     """请求处理结果维度，取值封闭、稳定，不含任何高基数信息。"""
@@ -44,6 +50,8 @@ class Result(str, Enum):
     DOWNSTREAM_STATUS = "downstream_status"
     DOWNSTREAM_INVALID = "downstream_invalid"
     INTERNAL_ERROR = "internal_error"
+    PARTIAL_FAILURE = "partial_failure"  # 聚合：部分依赖失败
+    AGGREGATE_FAILED = "aggregate_failed"  # 聚合：全部依赖失败
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +62,19 @@ class LatencySample:
     result: Result
     duration_ms: float
     trace_source: str  # upstream / generated / rejected，封闭三值
+
+
+@dataclass(frozen=True, slots=True)
+class DependencySample:
+    """一次聚合中单个下游依赖调用的指标采样点。
+
+    ``dependency`` 只取依赖声明中的稳定名称（配置白名单），请求标识、
+    参数值、真实路径等高基数信息绝不进入该标签。
+    """
+
+    dependency: str
+    result: Result
+    duration_ms: float
 
 
 @dataclass(slots=True)
@@ -78,12 +99,18 @@ class MetricsRegistry:
     """
 
     max_route_cardinality: int = MAX_ROUTE_CARDINALITY
+    max_dependency_cardinality: int = MAX_DEPENDENCY_CARDINALITY
     _requests_total: dict[tuple[str, str, str], int] = field(default_factory=dict)
     _latency: dict[tuple[str, str, str], _LatencyAgg] = field(default_factory=dict)
     _routes: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _degraded: bool = False
     _overflow_samples: int = 0
+    _dep_requests_total: dict[tuple[str, str], int] = field(default_factory=dict)
+    _dep_latency: dict[tuple[str, str], _LatencyAgg] = field(default_factory=dict)
+    _dependencies: set[str] = field(default_factory=set)
+    _dep_degraded: bool = False
+    _dep_overflow_samples: int = 0
 
     def record(self, sample: LatencySample) -> bool:
         """记录一次采样。
@@ -124,6 +151,45 @@ class MetricsRegistry:
             )
         return OVERFLOW_ROUTE, True
 
+    def record_dependency(self, sample: DependencySample) -> bool:
+        """记录一次逐依赖采样。
+
+        返回 True 表示按原始维度正常记账；False 表示依赖标签触发基数
+        保护，样本已合并进 ``__overflow__``（不丢弃、不抛错）。
+        """
+        with self._lock:
+            dependency, degraded = self._resolve_dependency(sample.dependency)
+            key = (dependency, sample.result.value)
+            self._dep_requests_total[key] = self._dep_requests_total.get(key, 0) + 1
+            agg = self._dep_latency.get(key)
+            if agg is None:
+                agg = _LatencyAgg()
+                self._dep_latency[key] = agg
+            agg.observe(sample.duration_ms)
+            if degraded:
+                self._dep_overflow_samples += 1
+            return not degraded
+
+    def _resolve_dependency(self, dependency: str) -> tuple[str, bool]:
+        """归并依赖标签；返回 (最终标签, 是否走了溢出降级)。调用方持锁。"""
+        if dependency in self._dependencies or dependency == OVERFLOW_DEPENDENCY:
+            self._dependencies.add(dependency)
+            return dependency, False
+        if len(self._dependencies) < self.max_dependency_cardinality:
+            self._dependencies.add(dependency)
+            return dependency, False
+        if not self._dep_degraded:
+            self._dep_degraded = True
+            logger.warning(
+                "dependency metrics cardinality limit reached; degrading to overflow label",
+                extra={
+                    "component": "metrics",
+                    "limit": self.max_dependency_cardinality,
+                    "overflow_dependency": OVERFLOW_DEPENDENCY,
+                },
+            )
+        return OVERFLOW_DEPENDENCY, True
+
     def snapshot(self) -> dict[str, object]:
         """导出当前指标快照，供读取端点与测试断言使用。"""
         with self._lock:
@@ -144,14 +210,38 @@ class MetricsRegistry:
                 }
                 for (route, result, trace_src), agg in sorted(self._latency.items())
             ]
+            dep_requests_total = [
+                {"dependency": dependency, "result": result, "count": count}
+                for (dependency, result), count in sorted(self._dep_requests_total.items())
+            ]
+            dep_latency = [
+                {
+                    "dependency": dependency,
+                    "result": result,
+                    "count": agg.count,
+                    "sum_ms": round(agg.total_ms, 3),
+                    "min_ms": round(agg.min_ms, 3) if agg.min_ms is not None else None,
+                    "max_ms": round(agg.max_ms, 3) if agg.max_ms is not None else None,
+                    "avg_ms": round(agg.total_ms / agg.count, 3),
+                }
+                for (dependency, result), agg in sorted(self._dep_latency.items())
+            ]
             return {
                 "requests_total": requests_total,
                 "request_latency_ms": latency,
+                "dependency_requests_total": dep_requests_total,
+                "dependency_latency_ms": dep_latency,
                 "cardinality": {
                     "distinct_routes": len(self._routes),
                     "limit": self.max_route_cardinality,
                     "degraded": self._degraded,
                     "overflow_samples": self._overflow_samples,
+                },
+                "dependency_cardinality": {
+                    "distinct_dependencies": len(self._dependencies),
+                    "limit": self.max_dependency_cardinality,
+                    "degraded": self._dep_degraded,
+                    "overflow_samples": self._dep_overflow_samples,
                 },
             }
 
@@ -163,6 +253,11 @@ class MetricsRegistry:
             self._routes.clear()
             self._degraded = False
             self._overflow_samples = 0
+            self._dep_requests_total.clear()
+            self._dep_latency.clear()
+            self._dependencies.clear()
+            self._dep_degraded = False
+            self._dep_overflow_samples = 0
 
 
 #: 进程级单例，供中间件与应用共享
