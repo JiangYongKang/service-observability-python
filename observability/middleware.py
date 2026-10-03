@@ -12,18 +12,29 @@
 3. 包装响应：路由模板（非原始路径）作为 route 标签；依据状态码与
    ``X-Error-Category`` 头把结果归入封闭的 :class:`Result`；标识来源
    作为取值固定的 ``trace`` 标签；
-4. 记录计数与延迟；非法标识不影响请求处理，只在响应头与指标上可区分。
+4. 记录计数与延迟；非法标识不影响请求处理，只在响应头与指标上可区分；
+5. 兜底收尾：下游应用抛出未预料异常且响应尚未开始时，在上下文仍绑定
+   标识的情况下记录日志并发出统一 500 错误响应，保证响应头、结构化
+   日志与指标结果维度上的追踪标识一致。
 """
 
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import asdict
 
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from observability.context import TRACE_HEADER, bind_trace_id, resolve_trace_id
-from observability.errors import ERROR_CATEGORY_HEADER
+from observability.errors import (
+    CATEGORY_MESSAGE,
+    CATEGORY_STATUS,
+    ERROR_CATEGORY_HEADER,
+    ErrorBody,
+    ErrorCategory,
+)
 from observability.logging_setup import get_logger
 from observability.metrics import (
     UNMATCHED_ROUTE,
@@ -75,10 +86,12 @@ class ObservabilityMiddleware:
 
         status_code = 500
         category_header: bytes | None = None
+        response_started = False
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status_code, category_header
+            nonlocal status_code, category_header, response_started
             if message["type"] == "http.response.start":
+                response_started = True
                 status_code = message["status"]
                 cleaned: list[tuple[bytes, bytes]] = []
                 for name, value in message.get("headers", []):
@@ -94,6 +107,33 @@ class ObservabilityMiddleware:
         start = time.perf_counter()
         try:
             await self.app(scope, receive, send_wrapper)
+        except Exception:
+            if response_started:
+                # 响应已开始，无法改写为错误响应，交由外层处理
+                raise
+            # 兜底收尾：在上下文仍绑定时记录日志并发出统一错误响应，
+            # 保证响应头 / 日志 / 指标上的追踪标识一致
+            status_code = CATEGORY_STATUS[ErrorCategory.INTERNAL_ERROR]
+            category_header = ErrorCategory.INTERNAL_ERROR.value.encode()
+            logger.error(
+                "unhandled exception",
+                extra={"component": "middleware", "path": scope.get("path", "-")},
+                exc_info=True,
+            )
+            body = ErrorBody(
+                error=CATEGORY_MESSAGE[ErrorCategory.INTERNAL_ERROR],
+                category=ErrorCategory.INTERNAL_ERROR.value,
+                trace_id=identity.trace_id,
+            )
+            payload = json.dumps(asdict(body)).encode()
+            await send_wrapper(
+                {
+                    "type": "http.response.start",
+                    "status": status_code,
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            await send({"type": "http.response.body", "body": payload})
         finally:
             duration_ms = (time.perf_counter() - start) * 1000.0
             route = scope.get("route")
