@@ -72,8 +72,22 @@
 | `downstream_status` | 下游非成功状态 |
 | `downstream_invalid` | 下游 2xx 但响应内容非法 |
 | `internal_error` | 其余 5xx / 未处理异常 |
+| `partial_failure` | 聚合请求：部分依赖失败 |
+| `aggregate_failed` | 聚合请求：全部依赖失败 |
 
 `trace` 取值封闭：`upstream` / `generated` / `rejected`，表示标识来源。
+
+### 2.1.1 逐依赖指标（聚合请求）
+
+聚合请求（`GET /aggregate`）除上述整体指标外，还按“具体哪个依赖 + 结果”
+记录：
+
+* `dependency_requests_total{dependency,result}`：依赖调用计数；
+* `dependency_latency_ms{dependency,result}`：依赖调用延迟（毫秒）聚合，
+  含 `count / sum_ms / min_ms / max_ms / avg_ms`。
+
+`dependency` 只取依赖声明中的**稳定名称**（配置白名单），`result` 复用上
+述封闭枚举；请求标识、参数值、真实路径等高基数信息绝不进入标签。
 
 ### 2.2 标签基数规则（防止高基数）
 
@@ -94,6 +108,11 @@
    `cardinality.overflow_samples`；
 3. 写一条结构化告警日志；
 4. **样本不被丢弃、计数与延迟照常累计，请求也不会因此失败。**
+
+依赖标签同理：`dependency` 的不同取值数上限为
+`MAX_DEPENDENCY_CARDINALITY = 20`（含占位）。超限后新依赖合并到
+`dependency=__overflow__`，快照中 `dependency_cardinality.degraded = true`
+并累计 `dependency_cardinality.overflow_samples`；样本不丢、请求不失败。
 
 ## 3. 下游错误分类
 
@@ -130,14 +149,71 @@
 * 底层细节（含上游状态码数值、异常堆栈）只写入服务端结构化日志；
 * 仅供内部使用的 `X-Error-Category` 响应头在出口被中间件剥离，不会透出。
 
-## 4. 结构化日志
+## 4. 聚合查询（`GET /aggregate`）
+
+聚合入口把一次请求扇出为对多个下游依赖的并发调用，全部收口（或到达总
+时长上限）后合并为单一响应。实现位于 `observability/aggregation.py`
+（`AggregationEngine`），路由装配见 `observability/app.py`。
+
+### 4.1 追踪标识的传递
+
+* 扇出的每个依赖调用都复用第 1 节的机制：经 `contextvars` 读取本次请求
+  的标识并以 `X-Request-ID` 透传，因此**每个依赖收到的标识与本次请求
+  对外回传的 `X-Request-ID` 完全一致**；
+* asyncio 为每个任务拷贝 `Context`，多个聚合请求并发时各自标识互不串号；
+* 无论本次聚合在依赖调用、结果合并还是其它未预料阶段结束，中间件都在
+  上下文仍绑定标识时完成收尾：响应头 `X-Request-ID`、结构化日志的
+  `trace_id` 与指标的 `trace` 维度三者一致；内部串联用的
+  `X-Error-Category` 头一律在出口剥离，不对外透出。
+
+### 4.2 逐依赖归因与整体结论
+
+每个依赖独立沿用第 3 节的错误分类（只依据异常类型与响应状态/形态，不
+依赖任何错误文案）。响应体按**依赖声明顺序**给出逐依赖结果，与依赖返
+回快慢、完成顺序无关：
+
+```json
+{
+  "status": "partial",
+  "trace_id": "agg-trace-0001",
+  "dependencies": {
+    "alpha": {"status": "ok", "data": {"item": "widget"}},
+    "beta": {"status": "error", "category": "downstream_status"}
+  }
+}
+```
+
+整体结论确定性三选一，只取决于各依赖的成败计数：
+
+| 结论 `status` | 判定 | 对外 HTTP 状态 | 指标 `result` |
+| --- | --- | --- | --- |
+| `ok` | 全部依赖成功 | `200` | `success` |
+| `partial` | 部分成功、部分失败 | `200` | `partial_failure` |
+| `failed` | 全部失败 | `502` | `aggregate_failed` |
+
+失败依赖的条目只含稳定 `category`（第 3 节枚举），不含上游状态码、地
+址、堆栈、上游原文等底层细节；这些只写入服务端结构化日志。
+
+### 4.3 总时长收口
+
+整次聚合受 `AGGREGATE_TOTAL_TIMEOUT`（秒，默认 `3.0`）限制：到点仍未
+完成的依赖被取消并记为 `downstream_timeout`，其余已完成的依赖结果照常
+合并——**单个依赖不返回不会拖死整次请求**。
+
+### 4.4 依赖集合配置
+
+依赖集合是稳定的声明式配置（名称 + 相对路径），默认见
+`DEFAULT_AGGREGATE_DEPENDENCIES`；名称是进指标标签的唯一依赖标识，因
+此必须低基数、不携带任何请求参数。
+
+## 5. 结构化日志
 
 * 所有日志为单行 JSON，固定字段：
   `timestamp / level / logger / message / trace_id`，`extra` 字段平铺；
 * 未绑定标识时 `trace_id` 为 `-`；
 * 异常以 `exception` 字段记录服务端堆栈，仅入日志。
 
-## 5. 本地验证
+## 6. 本地验证
 
 ```bash
 # 安装依赖（含 pytest / pytest-asyncio）
@@ -147,10 +223,11 @@ uv sync
 uv run python -m pytest
 
 # 仅按主题运行
-uv run python -m pytest tests/test_trace.py     # 追踪标识与并发隔离
-uv run python -m pytest tests/test_metrics.py   # 指标口径与基数降级
-uv run python -m pytest tests/test_errors.py    # 下游异常分类与脱敏
-uv run python -m pytest tests/test_logging.py   # 结构化日志关联
+uv run python -m pytest tests/test_trace.py        # 追踪标识与并发隔离
+uv run python -m pytest tests/test_metrics.py      # 指标口径与基数降级
+uv run python -m pytest tests/test_errors.py       # 下游异常分类与脱敏
+uv run python -m pytest tests/test_logging.py      # 结构化日志关联
+uv run python -m pytest tests/test_aggregation.py  # 聚合：并发/归因/收口/逐依赖指标/兜底
 
 # 启动服务
 uv run uvicorn main:app --reload
@@ -159,11 +236,13 @@ uv run uvicorn main:app --reload
 curl -i http://127.0.0.1:8000/                                   # 既有行为不变
 curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/ # upstream
 curl -i -H 'X-Request-ID: bad!!' http://127.0.0.1:8000/         # rejected
+curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/aggregate # 聚合查询
 curl -s http://127.0.0.1:8000/metrics | python -m json.tool     # 指标快照
 ```
 
 下游地址与超时通过环境变量配置：`DOWNSTREAM_BASE_URL`、
-`DOWNSTREAM_TIMEOUT`（秒，默认 2.0）。
+`DOWNSTREAM_TIMEOUT`（秒，默认 2.0）、`AGGREGATE_TOTAL_TIMEOUT`（聚合总
+时长上限，秒，默认 3.0）。
 
 测试中通过 `app.state.downstream_client` 注入基于 `httpx.MockTransport`
 的替身来确定性地模拟超时、连接失败、非成功状态与非法内容；各用例都会
