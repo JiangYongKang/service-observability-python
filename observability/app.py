@@ -23,8 +23,11 @@ from fastapi.responses import JSONResponse
 
 from observability.aggregation import (
     DEFAULT_TOTAL_TIMEOUT_SECONDS,
+    AggregateResult,
+    AggregateVerdict,
     AggregationEngine,
     DependencySpec,
+    DependencyStatus,
 )
 from observability.context import current_trace_id
 from observability.downstream import DownstreamClient
@@ -100,9 +103,61 @@ def _get_aggregate_timeout(request: Request) -> float:
     return float(getattr(request.app.state, "aggregate_total_timeout", AGGREGATE_TOTAL_TIMEOUT))
 
 
-def _render_aggregate_response(result) -> JSONResponse:
-    """把聚合收口结果渲染为对外响应（骨架：占位实现）。"""
-    raise NotImplementedError
+#: 聚合整体结论 → 对外 HTTP 状态码（部分失败仍返回数据，故为 200）
+_VERDICT_STATUS: dict[AggregateVerdict, int] = {
+    AggregateVerdict.OK: 200,
+    AggregateVerdict.PARTIAL: 200,
+    AggregateVerdict.FAILED: 502,
+}
+
+#: 聚合整体结论 → 内部错误类别头（中间件据此归类指标结果维度，出口剥离）
+_VERDICT_CATEGORY_HEADER: dict[AggregateVerdict, str] = {
+    AggregateVerdict.PARTIAL: "partial_failure",
+    AggregateVerdict.FAILED: "aggregate_failed",
+}
+
+
+def _render_aggregate_response(result: AggregateResult) -> JSONResponse:
+    """把聚合收口结果渲染为对外响应。
+
+    响应体只含稳定结论、逐依赖状态/类别与追踪标识；上游状态码、地址、
+    堆栈等底层细节只进服务端日志，不进响应。
+    """
+    trace_id = current_trace_id() or "-"
+    dependencies: dict[str, Any] = {}
+    for outcome in result.outcomes:
+        if outcome.status is DependencyStatus.OK:
+            dependencies[outcome.name] = {"status": "ok", "data": outcome.data}
+        else:
+            category = outcome.category or ErrorCategory.INTERNAL_ERROR
+            dependencies[outcome.name] = {
+                "status": "error",
+                "category": category.value,
+            }
+    logger.info(
+        "aggregate request completed",
+        extra={
+            "component": "app",
+            "verdict": result.verdict.value,
+            "dependencies": {
+                name: entry["status"] for name, entry in dependencies.items()
+            },
+        },
+    )
+    body = {
+        "status": result.verdict.value,
+        "trace_id": trace_id,
+        "dependencies": dependencies,
+    }
+    headers: dict[str, str] = {}
+    category = _VERDICT_CATEGORY_HEADER.get(result.verdict)
+    if category is not None:
+        headers[ERROR_CATEGORY_HEADER] = category
+    return JSONResponse(
+        status_code=_VERDICT_STATUS[result.verdict],
+        content=body,
+        headers=headers,
+    )
 
 
 def _register_routes(app: FastAPI) -> None:

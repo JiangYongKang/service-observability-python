@@ -46,6 +46,8 @@ _CATEGORY_TO_RESULT = {
     b"downstream_status": Result.DOWNSTREAM_STATUS,
     b"downstream_invalid_response": Result.DOWNSTREAM_INVALID,
     b"internal_error": Result.INTERNAL_ERROR,
+    b"partial_failure": Result.PARTIAL_FAILURE,
+    b"aggregate_failed": Result.AGGREGATE_FAILED,
 }
 
 
