@@ -83,6 +83,19 @@
 * `result`、`trace` 均为取值固定的枚举；
 * 追踪标识的**值本身**不会出现在任何指标标签中。
 
+### 2.2.1 聚合场景的逐依赖指标
+
+聚合请求（`GET /aggregate`，见第 5 节）在整体请求维度之外，按“哪个
+依赖 + 结果”另记一组指标：
+
+* `dependency_requests_total{dependency,result}`：逐依赖调用计数；
+* `dependency_latency_ms{dependency,result}`：逐依赖延迟聚合
+  （`count / sum_ms / min_ms / max_ms / avg_ms`）；
+* `dependency` 只允许取应用配置的依赖白名单名称
+  （`observability/app.py` 的 `AGGREGATE_DEPENDENCY_PATHS` 键），
+  `result` 与整体请求共用同一套封闭枚举；
+* 请求标识、具体参数值、真实路径等高基数信息**绝不**进入标签。
+
 ### 2.3 超出基数上限时的降级行为
 
 `route` 的不同取值数有明确上限（`MAX_ROUTE_CARDINALITY = 50`，含两个
@@ -94,6 +107,11 @@
    `cardinality.overflow_samples`；
 3. 写一条结构化告警日志；
 4. **样本不被丢弃、计数与延迟照常累计，请求也不会因此失败。**
+
+`dependency` 标签采用**同一套降级方式**：不同取值数上限为
+`MAX_DEPENDENCY_CARDINALITY = 20`，超限后新依赖合并进
+`dependency=__overflow__`，快照中 `cardinality.dependency_degraded = true`
+并累计 `cardinality.dependency_overflow_samples`；样本不丢、请求不失败。
 
 ## 3. 下游错误分类
 
@@ -137,7 +155,75 @@
 * 未绑定标识时 `trace_id` 为 `-`；
 * 异常以 `exception` 字段记录服务端堆栈，仅入日志。
 
-## 5. 本地验证
+## 5. 聚合查询（多依赖并发）
+
+`GET /aggregate` 面向“同时从多个下游依赖拉数据、拿到（或到点收口）后
+合并为一个响应”的场景。实现位于 `observability/aggregate.py`，路由装配
+见 `observability/app.py`。
+
+### 5.1 请求形态与依赖白名单
+
+* 可选查询参数 `deps=items,pricing` 指定本次要打的依赖子集；缺省为全部
+  已配置依赖；
+* 依赖名只能来自应用配置的固定白名单（`AGGREGATE_DEPENDENCY_PATHS`），
+  白名单外的名称一律 `400`（固定文案，不回显输入）——这也是依赖标签
+  基数有界的来源；
+* 每个依赖一个 asyncio 任务并发调用，任务拷贝当前 `Context`，因此每个
+  下游请求自动携带**本次请求自己的** `X-Request-ID`，与对外回传的标识
+  一致；并发请求之间由 contextvars 隔离，不会串号。
+
+### 5.2 逐依赖归因与整体判定
+
+每个依赖独立沿用第 3 节的错误分类（判定只依据异常类型与响应状态/形态，
+不读任何错误文案），结果互不影响、不会混装。响应体中逐依赖条目按名称
+排序（与完成顺序无关）：
+
+```json
+{
+  "status": "partial",
+  "dependencies": [
+    {"name": "inventory", "status": "ok", "category": null, "data": {"item": "..."}},
+    {"name": "items", "status": "ok", "category": null, "data": {"item": "..."}},
+    {"name": "pricing", "status": "failed", "category": "downstream_status", "data": null}
+  ],
+  "trace_id": "..."
+}
+```
+
+整体结论的判定规则固定，只依赖各依赖的**结果集合**，与依赖返回快慢、
+完成顺序无关：
+
+| 结果集合 | `status` | HTTP 状态 | 说明 |
+| --- | --- | --- | --- |
+| 全部成功 | `ok` | `200` | 各依赖数据按名称合并返回 |
+| 有成功也有失败 | `partial` | `200` | 失败依赖带 `category`，成功依赖带 `data` |
+| 全部失败 | `failed` | 由整体类别映射（同第 3 节） | 另含 `error`/`category` 字段 |
+
+全部失败时的整体类别按**固定优先级**从各失败类别中选取（
+`downstream_timeout` > `downstream_connection` > `downstream_status` >
+`downstream_invalid_response` > `internal_error`），同样是确定性的、不
+依赖错误文案。对外响应只含稳定类别与成功依赖的数据，不泄露地址、堆栈、
+上游原文等底层细节。
+
+### 5.3 总时长受控
+
+整次聚合有总时长上限（环境变量 `AGGREGATE_TOTAL_TIMEOUT`，默认 3.0 秒）。
+到点仍未完成的依赖被取消并按 `downstream_timeout` 记入其结果，整次请求
+照常收口返回——个别依赖不返回不会拖死整次请求。
+
+### 5.4 指标与兜底收尾
+
+* 整体请求照常计入 `requests_total{route="/aggregate",result,trace}`：
+  `ok`/`partial` 记 `success`，全部失败按整体类别记账；
+* 每个依赖的成败与延迟计入第 2.2.1 节的逐依赖指标；
+* 无论聚合在依赖调用、结果合并还是其它未预期阶段结束，追踪标识在
+  响应头、结构化日志与指标结果维度上都对得上：未预期异常由
+  `ObservabilityMiddleware` 的兜底收尾直接生成固定结构的 500 错误体
+  （Starlette 的 `ServerErrorMiddleware` 在用户中间件之外，若不兜底，
+  其响应会绕过追踪头注入），内部串联用的 `X-Error-Category` 头在任何
+  路径下都不会透出。
+
+## 6. 本地验证
 
 ```bash
 # 安装依赖（含 pytest / pytest-asyncio）
@@ -147,10 +233,11 @@ uv sync
 uv run python -m pytest
 
 # 仅按主题运行
-uv run python -m pytest tests/test_trace.py     # 追踪标识与并发隔离
-uv run python -m pytest tests/test_metrics.py   # 指标口径与基数降级
-uv run python -m pytest tests/test_errors.py    # 下游异常分类与脱敏
-uv run python -m pytest tests/test_logging.py   # 结构化日志关联
+uv run python -m pytest tests/test_trace.py      # 追踪标识与并发隔离
+uv run python -m pytest tests/test_metrics.py    # 指标口径与基数降级
+uv run python -m pytest tests/test_errors.py     # 下游异常分类与脱敏
+uv run python -m pytest tests/test_logging.py    # 结构化日志关联
+uv run python -m pytest tests/test_aggregate.py  # 聚合：并发/归因/总时长/逐依赖指标/兜底
 
 # 启动服务
 uv run uvicorn main:app --reload
@@ -159,11 +246,14 @@ uv run uvicorn main:app --reload
 curl -i http://127.0.0.1:8000/                                   # 既有行为不变
 curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/ # upstream
 curl -i -H 'X-Request-ID: bad!!' http://127.0.0.1:8000/         # rejected
+curl -i -H 'X-Request-ID: my-trace-1234' \
+     'http://127.0.0.1:8000/aggregate?deps=items,pricing'       # 聚合查询
 curl -s http://127.0.0.1:8000/metrics | python -m json.tool     # 指标快照
 ```
 
 下游地址与超时通过环境变量配置：`DOWNSTREAM_BASE_URL`、
-`DOWNSTREAM_TIMEOUT`（秒，默认 2.0）。
+`DOWNSTREAM_TIMEOUT`（秒，默认 2.0）；聚合总时长上限：
+`AGGREGATE_TOTAL_TIMEOUT`（秒，默认 3.0）。
 
 测试中通过 `app.state.downstream_client` 注入基于 `httpx.MockTransport`
 的替身来确定性地模拟超时、连接失败、非成功状态与非法内容；各用例都会
