@@ -122,6 +122,7 @@
 
 | 触发条件（依据） | 错误类别 `category` | 对外 HTTP 状态 |
 | --- | --- | --- |
+| 调用方请求不被接受（如聚合选择了目录外的依赖） | `invalid_request` | `400` |
 | `httpx.TimeoutException`（连接/读/连接池超时） | `downstream_timeout` | `504` |
 | 其余 `httpx.TransportError` / `RequestError`（DNS、拒绝连接、重置、协议错误等） | `downstream_connection` | `502` |
 | 下游返回非 2xx 状态码 | `downstream_status` | `502` |
@@ -200,11 +201,41 @@
 完成的依赖被取消并记为 `downstream_timeout`，其余已完成的依赖结果照常
 合并——**单个依赖不返回不会拖死整次请求**。
 
-### 4.4 依赖集合配置
+### 4.4 依赖集合配置与使用方选择
 
-依赖集合是稳定的声明式配置（名称 + 相对路径），默认见
-`DEFAULT_AGGREGATE_DEPENDENCIES`；名称是进指标标签的唯一依赖标识，因
-此必须低基数、不携带任何请求参数。
+依赖集合是稳定的声明式目录（名称 + 相对路径），真实运行路径默认就扇出
+**多个**下游，无需任何测试桩注入。
+
+**目录配置（部署侧）**
+
+* 目录来自环境变量 `AGGREGATE_DEPENDENCIES`，格式为逗号分隔的
+  `name=path` 声明，例如
+  `AGGREGATE_DEPENDENCIES="items=/items/aggregate,pricing=/pricing/aggregate,inventory=/inventory/aggregate"`；
+* 不配置时使用内置默认目录（`items / pricing / inventory` 三个依赖）；
+* 名称只允许小写字母、数字、`_`、`-`（长度 2..32），是进指标标签的唯一
+  依赖标识，必须低基数、不携带任何请求参数；路径必须以 `/` 开头；
+* 名称重复或条目非法在**启动期直接 fail fast**，不把脏配置带进运行路径；
+  目录为空同样在启动期被拒绝。
+
+**使用方按需选择（请求侧）**
+
+* `GET /aggregate` 不带参数时，扇出目录中的**全部**依赖（默认行为）；
+* `GET /aggregate?deps=items,inventory` 只扇出所选依赖：逗号分隔，也可
+  重复传 `deps` 参数；重复名称自动去重；
+* 选择结果按**目录声明顺序**收口，与 `deps` 的书写顺序、依赖完成顺序
+  都无关；
+* 名称非法或不在目录内时，请求在发起任何下游调用**之前**被拒绝：
+
+```json
+{
+  "error": "invalid request",
+  "category": "invalid_request",
+  "trace_id": "..."
+}
+```
+
+  返回 `400`，整体指标记为 `result=client_error`；响应不回显原始输入、
+  不泄露目录结构，逐依赖指标也不会为被拒绝的选择记账。
 
 ## 5. 结构化日志
 
@@ -228,22 +259,41 @@ uv run python -m pytest tests/test_metrics.py      # 指标口径与基数降级
 uv run python -m pytest tests/test_errors.py       # 下游异常分类与脱敏
 uv run python -m pytest tests/test_logging.py      # 结构化日志关联
 uv run python -m pytest tests/test_aggregation.py  # 聚合：并发/归因/收口/逐依赖指标/兜底
+uv run python -m pytest tests/test_aggregate_realtime.py  # 聚合真实路径：默认多扇出/deps选择/配置目录
 
-# 启动服务
+# 启动服务（默认扇出 items/pricing/inventory 三个下游）
 uv run uvicorn main:app --reload
 
 # 手动验证
 curl -i http://127.0.0.1:8000/                                   # 既有行为不变
 curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/ # upstream
 curl -i -H 'X-Request-ID: bad!!' http://127.0.0.1:8000/         # rejected
-curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/aggregate # 聚合查询
+# 聚合查询：缺省并发扇出目录内全部下游
+curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/aggregate
+# 只扇出使用方选择的部分下游
+curl -i -H 'X-Request-ID: my-trace-1234' 'http://127.0.0.1:8000/aggregate?deps=items,inventory'
+# 选择目录外的依赖 -> 400 invalid_request（不发起任何下游调用）
+curl -i 'http://127.0.0.1:8000/aggregate?deps=ghost'
 curl -s http://127.0.0.1:8000/metrics | python -m json.tool     # 指标快照
 ```
 
 下游地址与超时通过环境变量配置：`DOWNSTREAM_BASE_URL`、
 `DOWNSTREAM_TIMEOUT`（秒，默认 2.0）、`AGGREGATE_TOTAL_TIMEOUT`（聚合总
-时长上限，秒，默认 3.0）。
+时长上限，秒，默认 3.0）、`AGGREGATE_DEPENDENCIES`（聚合依赖目录，
+`name=path` 逗号分隔，默认 `items/pricing/inventory` 三个依赖）。
+
+带自定义依赖目录启动的例子：
+
+```bash
+AGGREGATE_DEPENDENCIES="svc_a=/svc-a,svc_b=/svc-b,svc_c=/svc-c" \
+  uv run uvicorn main:app --reload
+# 此时 /aggregate 默认并发扇出 svc_a/svc_b/svc_c，
+# /aggregate?deps=svc_b 只扇出 svc_b。
+```
 
 测试中通过 `app.state.downstream_client` 注入基于 `httpx.MockTransport`
 的替身来确定性地模拟超时、连接失败、非成功状态与非法内容；各用例都会
-打印输入场景与判定依据（`[input]` / `[judge]`）。
+打印输入场景与判定依据（`[input]` / `[judge]`）。运行整套测试时，末尾会
+额外打印“业务覆盖与逐用例判定”汇总，按业务域（追踪 / 指标 / 错误分类 /
+日志 / 应用契约 / 聚合 / 聚合真实路径）列出覆盖到的用例及通过情况，便于
+一眼看出各业务的覆盖与判定。

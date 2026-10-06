@@ -21,6 +21,7 @@ ERROR_CATEGORY_HEADER = "X-Error-Category"
 class ErrorCategory(str, Enum):
     """稳定的错误类别。判定依据是异常/响应的类型与状态码，不依赖消息文本。"""
 
+    INVALID_REQUEST = "invalid_request"
     DOWNSTREAM_TIMEOUT = "downstream_timeout"
     DOWNSTREAM_CONNECTION = "downstream_connection"
     DOWNSTREAM_STATUS = "downstream_status"
@@ -88,6 +89,18 @@ class DownstreamInvalidResponseError(DownstreamError):
         return self._reason
 
 
+class InvalidRequestError(Exception):
+    """调用方请求不被接受（如选择了目录外的聚合依赖）。
+
+    归因只依据参数与白名单的比对结果，不回显、不依赖任何外部文案；对外
+    统一为封闭类别 ``invalid_request``。
+    """
+
+    def __init__(self, category: ErrorCategory = ErrorCategory.INVALID_REQUEST) -> None:
+        super().__init__(f"invalid request: {category.value}")
+        self._category = category
+
+
 @dataclass(frozen=True, slots=True)
 class ErrorBody:
     """对外错误响应体：固定结构，不含底层异常细节。"""
@@ -99,6 +112,7 @@ class ErrorBody:
 
 #: 错误类别到对外 HTTP 状态码的稳定映射
 CATEGORY_STATUS: dict[ErrorCategory, int] = {
+    ErrorCategory.INVALID_REQUEST: status.HTTP_400_BAD_REQUEST,
     ErrorCategory.DOWNSTREAM_TIMEOUT: status.HTTP_504_GATEWAY_TIMEOUT,
     ErrorCategory.DOWNSTREAM_CONNECTION: status.HTTP_502_BAD_GATEWAY,
     ErrorCategory.DOWNSTREAM_STATUS: status.HTTP_502_BAD_GATEWAY,
@@ -108,6 +122,7 @@ CATEGORY_STATUS: dict[ErrorCategory, int] = {
 
 #: 面向调用方的稳定短语，不随底层实现变化
 CATEGORY_MESSAGE: dict[ErrorCategory, str] = {
+    ErrorCategory.INVALID_REQUEST: "invalid request",
     ErrorCategory.DOWNSTREAM_TIMEOUT: "downstream request timed out",
     ErrorCategory.DOWNSTREAM_CONNECTION: "downstream service unreachable",
     ErrorCategory.DOWNSTREAM_STATUS: "downstream returned an error status",

@@ -52,6 +52,7 @@ RESPONSE_TRACE_HEADER = TRACE_HEADER
 TRACE_SOURCE_HEADER = "X-Trace-Source"
 
 _CATEGORY_TO_RESULT = {
+    b"invalid_request": Result.CLIENT_ERROR,
     b"downstream_timeout": Result.DOWNSTREAM_TIMEOUT,
     b"downstream_connection": Result.DOWNSTREAM_CONNECTION,
     b"downstream_status": Result.DOWNSTREAM_STATUS,

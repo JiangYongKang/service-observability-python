@@ -30,6 +30,8 @@ from observability.aggregation import (
     AggregationEngine,
     DependencySpec,
     DependencyStatus,
+    parse_dependency_catalog,
+    select_dependencies,
 )
 from observability.context import current_trace_id
 from observability.downstream import DownstreamClient
@@ -40,6 +42,7 @@ from observability.errors import (
     DownstreamError,
     ErrorBody,
     ErrorCategory,
+    InvalidRequestError,
 )
 from observability.logging_setup import configure_logging, get_logger
 from observability.middleware import ObservabilityMiddleware
@@ -54,9 +57,28 @@ AGGREGATE_TOTAL_TIMEOUT = float(
     os.environ.get("AGGREGATE_TOTAL_TIMEOUT", str(DEFAULT_TOTAL_TIMEOUT_SECONDS))
 )
 
-#: 聚合默认扇出的依赖集合（名称稳定、进指标标签；可被 app.state 覆盖）
-DEFAULT_AGGREGATE_DEPENDENCIES: tuple[DependencySpec, ...] = (
-    DependencySpec(name="items", path="/items/aggregate"),
+#: 聚合默认扇出的依赖目录：name=path，逗号分隔；名称稳定、进指标标签。
+#: 使用方通过 AGGREGATE_DEPENDENCIES 环境变量配置真实要打的下游集合；
+#: 缺省即包含多个依赖，使 /aggregate 的真实运行路径就是多依赖并发扇出。
+DEFAULT_AGGREGATE_DEPENDENCIES_RAW = (
+    "items=/items/aggregate,pricing=/pricing/aggregate,inventory=/inventory/aggregate"
+)
+AGGREGATE_DEPENDENCIES_RAW = os.environ.get(
+    "AGGREGATE_DEPENDENCIES", DEFAULT_AGGREGATE_DEPENDENCIES_RAW
+)
+
+
+def _load_default_dependencies(raw: str) -> tuple[DependencySpec, ...]:
+    """启动期解析依赖目录，配置非法直接 fail fast。"""
+    dependencies = parse_dependency_catalog(raw)
+    if not dependencies:
+        raise RuntimeError("AGGREGATE_DEPENDENCIES must declare at least one dependency")
+    return tuple(dependencies)
+
+
+#: 聚合可扇出的依赖目录（白名单），默认全部扇出，可由 app.state 覆盖
+DEFAULT_AGGREGATE_DEPENDENCIES: tuple[DependencySpec, ...] = _load_default_dependencies(
+    AGGREGATE_DEPENDENCIES_RAW
 )
 
 
@@ -92,12 +114,40 @@ def _get_downstream(request: Request) -> DownstreamClient:
     return client
 
 
-def _get_aggregate_dependencies(request: Request) -> list[DependencySpec]:
-    """依赖：允许测试通过 ``app.state.aggregate_dependencies`` 注入依赖集合。"""
+def _get_aggregate_catalog(request: Request) -> list[DependencySpec]:
+    """依赖：可扇出的依赖目录（白名单），允许测试经 app.state 覆盖。"""
     deps = getattr(request.app.state, "aggregate_dependencies", None)
     if deps is None:
         deps = list(DEFAULT_AGGREGATE_DEPENDENCIES)
     return deps
+
+
+def _resolve_requested_dependencies(
+    request: Request, catalog: list[DependencySpec]
+) -> list[DependencySpec]:
+    """从 ``deps`` 查询参数解析使用方选择的依赖；缺省扇出整个目录。
+
+    多个名称以逗号分隔（也可重复传参），按目录声明顺序去重收口；名称
+    非法或不在目录内一律拒绝，不发起任何下游调用。
+    """
+    raw_values = request.query_params.getlist("deps")
+    selected: list[str] = []
+    for value in raw_values:
+        selected.extend(part.strip() for part in value.split(",") if part.strip())
+    try:
+        return select_dependencies(catalog, selected or None)
+    except ValueError as exc:
+        # 判定只基于名称与白名单的比对，不回显外部输入，不泄露目录之外的信息
+        logger.info(
+            "aggregate request rejected: unknown or invalid dependency selection",
+            extra={
+                "component": "app",
+                "path": request.url.path,
+                "trace_id": current_trace_id() or "-",
+                "reason": exc.args[0] if exc.args else "invalid_selection",
+            },
+        )
+        raise InvalidRequestError() from None
 
 
 def _get_aggregate_timeout(request: Request) -> float:
@@ -188,10 +238,11 @@ def _register_routes(app: FastAPI) -> None:
     async def get_aggregate(
         request: Request,
         downstream: DownstreamClient = Depends(_get_downstream),
-        dependencies: list[DependencySpec] = Depends(_get_aggregate_dependencies),
+        catalog: list[DependencySpec] = Depends(_get_aggregate_catalog),
         total_timeout: float = Depends(_get_aggregate_timeout),
     ) -> JSONResponse:
-        # 骨架：扇出/收口逻辑在 AggregationEngine 中实现，此处仅装配
+        # 使用方可经 deps 查询参数选择扇出哪些下游（目录白名单内）；缺省全扇出
+        dependencies = _resolve_requested_dependencies(request, catalog)
         engine = AggregationEngine(
             downstream, dependencies, total_timeout=total_timeout
         )
@@ -200,6 +251,32 @@ def _register_routes(app: FastAPI) -> None:
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(InvalidRequestError)
+    async def _handle_invalid_request(
+        request: Request, exc: InvalidRequestError
+    ) -> JSONResponse:
+        category = exc._category
+        trace_id = current_trace_id() or "-"
+        logger.info(
+            "request rejected",
+            extra={
+                "component": "app",
+                "path": request.url.path,
+                "category": category.value,
+                "trace_id": trace_id,
+            },
+        )
+        body = ErrorBody(
+            error=CATEGORY_MESSAGE[category],
+            category=category.value,
+            trace_id=trace_id,
+        )
+        return JSONResponse(
+            status_code=CATEGORY_STATUS[category],
+            content=asdict(body),
+            headers={ERROR_CATEGORY_HEADER: category.value},
+        )
+
     @app.exception_handler(DownstreamError)
     async def _handle_downstream(request: Request, exc: DownstreamError) -> JSONResponse:
         category: ErrorCategory = exc._category

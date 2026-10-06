@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -66,6 +67,79 @@ class DependencySpec:
 
     name: str
     path: str
+
+
+#: 依赖名允许的字符集：小写字母、数字、下划线、连字符
+_DEP_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{2,32}$")
+
+#: 单条依赖声明（name=path）中 name 与 path 的分隔符
+_DECLARATION_SEPARATOR = "="
+
+
+def _validate_dependency_name(name: str) -> None:
+    """校验依赖名是否为低基数、可作指标标签的稳定标识。"""
+    if not _DEP_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"invalid dependency name {name!r}: expected 2-32 chars of "
+            "lowercase letters, digits, '_' or '-'"
+        )
+
+
+def _validate_dependency_path(path: str) -> None:
+    """校验依赖路径：必须为以 ``/`` 开头的站相对路径。"""
+    if not path.startswith("/"):
+        raise ValueError(f"invalid dependency path {path!r}: must start with '/'")
+
+
+def parse_dependency_catalog(raw: str) -> list[DependencySpec]:
+    """解析逗号分隔的依赖声明目录（``name=path,name=path``）。
+
+    声明式、低基数：名称只允许小写字母/数字/下划线/连字符，路径必须以
+    ``/`` 开头；名称重复或条目非法直接抛 :class:`ValueError`（启动期
+    fail fast），避免脏配置进入运行路径。
+    """
+    catalog: list[DependencySpec] = []
+    seen: set[str] = set()
+    for chunk in raw.split(","):
+        declaration = chunk.strip()
+        if not declaration:
+            continue
+        if _DECLARATION_SEPARATOR not in declaration:
+            raise ValueError(
+                f"invalid dependency declaration {declaration!r}: expected 'name=path'"
+            )
+        name, path = declaration.split(_DECLARATION_SEPARATOR, 1)
+        name, path = name.strip(), path.strip()
+        _validate_dependency_name(name)
+        _validate_dependency_path(path)
+        if name in seen:
+            raise ValueError(f"duplicate dependency name {name!r}")
+        seen.add(name)
+        catalog.append(DependencySpec(name=name, path=path))
+    return catalog
+
+
+def select_dependencies(
+    catalog: list[DependencySpec], selected: list[str] | None
+) -> list[DependencySpec]:
+    """按使用方选择的名称从目录中挑出依赖，保持目录声明顺序。
+
+    * ``selected`` 为空（未传选择）时返回整个目录（默认全扇出）；
+    * 名称必须在目录内、且为合法低基数名称，否则抛 :class:`ValueError`；
+    * 重复选择自动去重，只扇出一次。
+    """
+    if not selected:
+        return list(catalog)
+    by_name = {dep.name: dep for dep in catalog}
+    chosen: list[DependencySpec] = []
+    for name in selected:
+        _validate_dependency_name(name)
+        if name not in by_name:
+            raise ValueError(f"unknown dependency {name!r}")
+        if name not in {dep.name for dep in chosen}:
+            chosen.append(by_name[name])
+    # 以目录声明顺序返回，结论与完成顺序、选择顺序均无关
+    return [dep for dep in catalog if dep.name in {d.name for d in chosen}]
 
 
 @dataclass(slots=True)
