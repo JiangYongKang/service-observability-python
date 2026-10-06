@@ -1,4 +1,9 @@
-"""测试共享夹具：内存 ASGI 客户端 + 可按场景编排的模拟下游。"""
+"""测试共享夹具：内存 ASGI 客户端 + 可按场景编排的模拟下游。
+
+运行 ``pytest`` 时会为每个用例打印分隔标题（业务文件::用例名），用例内
+``[input]``（场景输入）/``[judge]``（判定情况）的打印随之可见，从而在
+单测日志里清楚看出覆盖了哪些业务、各业务有哪些用例以及每条判定结论。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,29 @@ from observability.aggregation import DependencySpec
 from observability.app import create_app
 from observability.downstream import DownstreamClient
 from observability.metrics import registry
+
+
+def pytest_runtest_logstart(nodeid, location):
+    """每个用例开始时打印分隔标题：业务模块 :: 用例（含参数化标识）。"""
+    line = f"\n===== 业务用例 :: {nodeid} ====="
+    print(line, flush=True)
+
+
+def pytest_runtest_logreport(report):
+    """用例结束后，把其 [input]/[judge] 判定摘要输出到结果行附近。
+
+    即便用例通过（默认会吞掉 stdout），也能在单测日志里看到该业务用例
+    的场景输入与判定情况；失败时 pytest 自身已展示完整 captured output，
+    这里不再重复。
+    """
+    if report.when != "call" or report.outcome != "passed":
+        return
+    text = getattr(report, "capstdout", "") or ""
+    lines = [ln for ln in text.splitlines() if "[input]" in ln or "[judge]" in ln]
+    for ln in lines:
+        print("   " + ln.strip())
+
+
 
 
 def make_downstream_handler(

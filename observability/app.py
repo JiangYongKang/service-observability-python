@@ -28,7 +28,6 @@ from observability.aggregation import (
     AggregateResult,
     AggregateVerdict,
     AggregationEngine,
-    DependencySpec,
     DependencyStatus,
 )
 from observability.context import current_trace_id
@@ -44,6 +43,10 @@ from observability.errors import (
 from observability.logging_setup import configure_logging, get_logger
 from observability.middleware import ObservabilityMiddleware
 from observability.metrics import registry
+from observability.registry import (
+    DependencyRegistry,
+    UnknownDependencySelectionError,
+)
 
 configure_logging()
 logger = get_logger("observability.app")
@@ -54,10 +57,9 @@ AGGREGATE_TOTAL_TIMEOUT = float(
     os.environ.get("AGGREGATE_TOTAL_TIMEOUT", str(DEFAULT_TOTAL_TIMEOUT_SECONDS))
 )
 
-#: 聚合默认扇出的依赖集合（名称稳定、进指标标签；可被 app.state 覆盖）
-DEFAULT_AGGREGATE_DEPENDENCIES: tuple[DependencySpec, ...] = (
-    DependencySpec(name="items", path="/items/aggregate"),
-)
+#: 未知依赖选择（使用方传入未声明名称）的稳定对外类别与提示
+UNKNOWN_DEPENDENCY_CATEGORY = "unknown_dependency"
+UNKNOWN_DEPENDENCY_MESSAGE = "unknown dependency selection"
 
 
 def create_app() -> FastAPI:
@@ -92,12 +94,40 @@ def _get_downstream(request: Request) -> DownstreamClient:
     return client
 
 
-def _get_aggregate_dependencies(request: Request) -> list[DependencySpec]:
-    """依赖：允许测试通过 ``app.state.aggregate_dependencies`` 注入依赖集合。"""
-    deps = getattr(request.app.state, "aggregate_dependencies", None)
-    if deps is None:
-        deps = list(DEFAULT_AGGREGATE_DEPENDENCIES)
-    return deps
+def _get_aggregate_registry(request: Request) -> DependencyRegistry:
+    """依赖：聚合可用的依赖白名单（注册表）。
+
+    解析顺序（均允许测试注入）：
+    1. ``app.state.aggregate_registry``：直接给注册表；
+    2. ``app.state.aggregate_dependencies``：给 ``DependencySpec`` 列表；
+    3. 缺省：按环境变量 ``AGGREGATE_DEPENDENCIES`` 构建（未设置时为内置
+       的多依赖默认集合）——因此正常部署下 ``GET /aggregate`` 一次就会
+       并发扇出多个下游，无需在测试里手工构造依赖集合。
+    """
+    state = request.app.state
+    configured = getattr(state, "aggregate_registry", None)
+    if configured is not None:
+        return configured
+    injected = getattr(state, "aggregate_dependencies", None)
+    if injected is not None:
+        return DependencyRegistry(injected)
+    built = DependencyRegistry.from_environment()
+    state.aggregate_registry = built
+    return built
+
+
+def _parse_deps_selection(request: Request) -> list[str] | None:
+    """从查询参数解析使用方选择的依赖名（``?deps=a,b``，可重复）。
+
+    仅解析，不做白名单判定（判定在注册表内）；未提供返回 None。
+    """
+    raw_values = request.query_params.getlist("deps")
+    if not raw_values:
+        return None
+    selected: list[str] = []
+    for value in raw_values:
+        selected.extend(part.strip() for part in value.split(",") if part.strip())
+    return selected or None
 
 
 def _get_aggregate_timeout(request: Request) -> float:
@@ -162,6 +192,28 @@ def _render_aggregate_response(result: AggregateResult) -> JSONResponse:
     )
 
 
+def _render_unknown_dependency_response(
+    exc: UnknownDependencySelectionError,
+) -> JSONResponse:
+    """使用方选择了未声明的依赖名：确定性 400。
+
+    响应体只回显稳定的可用依赖名白名单（本身低基数、对外可枚举），
+    不回显原始输入、路径或任何底层细节。
+    """
+    trace_id = current_trace_id() or "-"
+    logger.warning(
+        "aggregate request selected unknown dependency",
+        extra={"component": "app", "available": list(exc.available)},
+    )
+    body = {
+        "error": UNKNOWN_DEPENDENCY_MESSAGE,
+        "category": UNKNOWN_DEPENDENCY_CATEGORY,
+        "trace_id": trace_id,
+        "available_dependencies": list(exc.available),
+    }
+    return JSONResponse(status_code=400, content=body)
+
+
 def _register_routes(app: FastAPI) -> None:
     @app.get("/", include_in_schema=False)
     async def read_root() -> dict[str, str]:
@@ -188,10 +240,15 @@ def _register_routes(app: FastAPI) -> None:
     async def get_aggregate(
         request: Request,
         downstream: DownstreamClient = Depends(_get_downstream),
-        dependencies: list[DependencySpec] = Depends(_get_aggregate_dependencies),
+        dep_registry: DependencyRegistry = Depends(_get_aggregate_registry),
         total_timeout: float = Depends(_get_aggregate_timeout),
     ) -> JSONResponse:
-        # 骨架：扇出/收口逻辑在 AggregationEngine 中实现，此处仅装配
+        # 扇出集合由注册表声明 + 使用方按名选择：不带 deps 即扇出全部
+        # 已声明依赖（默认即多个下游并发）；未知名称得到确定性 400
+        try:
+            dependencies = dep_registry.select(_parse_deps_selection(request))
+        except UnknownDependencySelectionError as exc:
+            return _render_unknown_dependency_response(exc)
         engine = AggregationEngine(
             downstream, dependencies, total_timeout=total_timeout
         )

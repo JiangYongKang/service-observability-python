@@ -200,11 +200,48 @@
 完成的依赖被取消并记为 `downstream_timeout`，其余已完成的依赖结果照常
 合并——**单个依赖不返回不会拖死整次请求**。
 
-### 4.4 依赖集合配置
+### 4.4 打哪些下游：依赖注册表与使用方选择
 
-依赖集合是稳定的声明式配置（名称 + 相对路径），默认见
-`DEFAULT_AGGREGATE_DEPENDENCIES`；名称是进指标标签的唯一依赖标识，因
-此必须低基数、不携带任何请求参数。
+可聚合的下游集合由**依赖注册表**（`observability/registry.py` 的
+`DependencyRegistry`）声明，是一张“稳定名称 → 相对路径”的白名单：
+
+* **部署配置**：通过环境变量 `AGGREGATE_DEPENDENCIES` 声明，形如
+
+  ```
+  AGGREGATE_DEPENDENCIES="items:/items/aggregate,stock:/stock/summary,pricing:/pricing/summary"
+  ```
+
+  名称允许 `[A-Za-z0-9_.-]{1,64}`；路径必须是以单个 `/` 开头、长度不超过
+  200、不含空白与 `://` 的相对路径。非法条目（空名/非法字符/非法路径）与
+  重名条目会被跳过并写一条结构化告警，**不会阻止服务启动**。未设置该环境
+  变量时使用内置的多依赖默认集合
+  （`DEFAULT_DEPENDENCY_CONFIG`，默认即 `items/stock/pricing` 三个下游），
+  因此正常调用 `GET /aggregate` 一次就会**并发扇出多个下游**，无需在测试
+  里手工构造依赖。
+* **使用方选择**：调用方可在请求中按名选择扇出子集：
+  * 不带 `deps`：扇出全部已声明依赖；
+  * `?deps=items,pricing`（逗号分隔）或 `?deps=items&deps=pricing`
+    （重复参数）：只扇出命中的依赖；重复名称去重。
+* 名称是唯一会进入 `deps` 参数与逐依赖指标标签的内容；真实下游路径只在
+  服务内部使用，不进标签、不进对外错误信息。
+* 返回的逐依赖结果**固定按注册表声明顺序**排列，与 `deps` 的书写顺序、
+  依赖返回快慢/完成顺序都无关。
+
+**未知选择**：`deps` 中出现任何未声明名称，请求在扇出前即被确定性拒绝，
+不调用任何下游，返回 `400`：
+
+```json
+{
+  "error": "unknown dependency selection",
+  "category": "unknown_dependency",
+  "trace_id": "...",
+  "available_dependencies": ["items", "pricing", "stock"]
+}
+```
+
+响应只回显稳定白名单（本身低基数、可对外枚举），**不回显原始输入**，因此
+路径穿越等注入串不会被反射，也不会被拼接进真实路径；整体指标记为
+`client_error`，且不产生逐依赖样本（扇出未发生）。
 
 ## 5. 结构化日志
 
@@ -223,27 +260,36 @@ uv sync
 uv run python -m pytest
 
 # 仅按主题运行
-uv run python -m pytest tests/test_trace.py        # 追踪标识与并发隔离
-uv run python -m pytest tests/test_metrics.py      # 指标口径与基数降级
-uv run python -m pytest tests/test_errors.py       # 下游异常分类与脱敏
-uv run python -m pytest tests/test_logging.py      # 结构化日志关联
-uv run python -m pytest tests/test_aggregation.py  # 聚合：并发/归因/收口/逐依赖指标/兜底
+uv run python -m pytest tests/test_trace.py                  # 追踪标识与并发隔离
+uv run python -m pytest tests/test_metrics.py                # 指标口径与基数降级
+uv run python -m pytest tests/test_errors.py                 # 下游异常分类与脱敏
+uv run python -m pytest tests/test_logging.py                # 结构化日志关联
+uv run python -m pytest tests/test_aggregation.py            # 聚合：并发/归因/收口/逐依赖指标/兜底
+uv run python -m pytest tests/test_aggregate_selection.py    # 真实路径多依赖扇出/按名选择/未知选择 400
 
 # 启动服务
 uv run uvicorn main:app --reload
 
-# 手动验证
-curl -i http://127.0.0.1:8000/                                   # 既有行为不变
-curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/ # upstream
-curl -i -H 'X-Request-ID: bad!!' http://127.0.0.1:8000/         # rejected
-curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/aggregate # 聚合查询
-curl -s http://127.0.0.1:8000/metrics | python -m json.tool     # 指标快照
+# 手动验证（默认声明 items/stock/pricing 三个下游，正常调用即并发扇出）
+curl -i http://127.0.0.1:8000/                                              # 既有行为不变
+curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/             # upstream
+curl -i -H 'X-Request-ID: bad!!' http://127.0.0.1:8000/                     # rejected
+curl -i -H 'X-Request-ID: my-trace-1234' http://127.0.0.1:8000/aggregate    # 扇出全部下游
+curl -i 'http://127.0.0.1:8000/aggregate?deps=pricing,items'                # 只扇出选中子集（按声明顺序返回）
+curl -i 'http://127.0.0.1:8000/aggregate?deps=nope'                         # 未知选择 -> 400
+curl -s http://127.0.0.1:8000/metrics | python -m json.tool                 # 指标快照
 ```
 
 下游地址与超时通过环境变量配置：`DOWNSTREAM_BASE_URL`、
 `DOWNSTREAM_TIMEOUT`（秒，默认 2.0）、`AGGREGATE_TOTAL_TIMEOUT`（聚合总
-时长上限，秒，默认 3.0）。
+时长上限，秒，默认 3.0）、`AGGREGATE_DEPENDENCIES`（可聚合下游声明，
+`name:/path,name:/path`；未设置时为内置的三依赖默认集合，见 4.4 节）。
+
+运行测试时每个用例会先打印一行 `===== 业务用例 :: <文件>::<用例> =====`
+标题，用例体内再打印 `[input]`（场景输入）与 `[judge]`（判定情况），从
+单测日志即可看出覆盖了哪些业务、各业务有哪些用例以及每条判定结论。
 
 测试中通过 `app.state.downstream_client` 注入基于 `httpx.MockTransport`
-的替身来确定性地模拟超时、连接失败、非成功状态与非法内容；各用例都会
-打印输入场景与判定依据（`[input]` / `[judge]`）。
+的替身来确定性地模拟超时、连接失败、非成功状态与非法内容；聚合相关测试
+通过 `app.state.aggregate_registry`（或 `aggregate_dependencies`）注入
+依赖集合。各用例都会打印输入场景与判定依据（`[input]` / `[judge]`）。
